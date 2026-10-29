@@ -5,6 +5,9 @@
 module System.OSX.FSEvents
   ( EventStream
   , eventStreamCreate
+  , eventStreamCreateSince
+  , eventFlagOwnEvent
+  , getCurrentEventId
   , eventStreamDestroy
   , Event (..)
   -- event callback flags
@@ -113,11 +116,27 @@ eventStreamCreate :: [FilePath]      -- ^ The paths to watch
                   -> Bool            -- ^ Get file-level notifications instead of directory level 
                   -> (Event -> IO a) -- ^ The action to run when an event has taken place
                   -> IO EventStream  -- ^ The event stream, use this to destroy the stream
-eventStreamCreate ps latency nodefer noself filelevel a = withCStringArray0 ps $ \pp ->
+eventStreamCreate ps latency nodefer noself filelevel =
+  eventStreamCreateSince ps 0 latency nodefer noself False filelevel
+
+-- | Like 'eventStreamCreate', but starts from the given event ID rather than
+-- \"since now\". Supplying an ID means the stream replays the events after it and
+-- then sends a HistoryDone sentinel event, which marks the point from which
+-- events are live (and from which the ignore-self flag applies).
+eventStreamCreateSince :: [FilePath]      -- ^ The paths to watch
+                       -> Word64          -- ^ Event ID to start from, or 0 for \"since now\"
+                       -> Double          -- ^ Latency
+                       -> Bool            -- ^ Process event immediately if no other events received for at least latency
+                       -> Bool            -- ^ Ignore events caused by current process
+                       -> Bool            -- ^ Tag events caused by current process with 'eventFlagOwnEvent'
+                       -> Bool            -- ^ Get file-level notifications instead of directory level
+                       -> (Event -> IO a) -- ^ The action to run when an event has taken place
+                       -> IO EventStream  -- ^ The event stream, use this to destroy the stream
+eventStreamCreateSince ps since latency nodefer noself markself filelevel a = withCStringArray0 ps $ \pp ->
   alloca $ \pfd -> do
   alloca $ \ppw -> do
     when (latency < 0) $ ioError (userError "latency must be nonnegative")
-    r <- c_createWatch pp (fromIntegral (length ps)) flags 0 (realToFrac latency) pfd ppw
+    r <- c_createWatch pp (fromIntegral (length ps)) flags since (realToFrac latency) pfd ppw
     when (r /= 0) $ ioError (userError "could not create file system event stream")
     h <- fdToHandle . Fd =<< peek pfd
     pw <- peek ppw
@@ -127,6 +146,7 @@ eventStreamCreate ps latency nodefer noself filelevel a = withCStringArray0 ps $
         where
           flags = condFlag createFlagNoDefer nodefer .|.
                   condFlag createFlagIgnoreSelf noself .|.
+                  condFlag createFlagMarkSelf markself .|.
                   condFlag createFlagFileEvents filelevel
 
 condFlag :: Word32 -> Bool -> Word32
@@ -141,6 +161,14 @@ createFlagIgnoreSelf = 0x00000008
 
 createFlagFileEvents :: Word32
 createFlagFileEvents = 0x00000010
+
+createFlagMarkSelf :: Word32
+createFlagMarkSelf = 0x00000020
+
+-- | Set on an event that FSEvents attributes to the current process. Only ever set when the
+-- stream was created with the MarkSelf flag.
+eventFlagOwnEvent :: Word64
+eventFlagOwnEvent = 0x00080000
 
 -- |  Destroy an event stream, the callback action will not be run for new events
 -- (but there may be pending events remaining)
@@ -193,6 +221,13 @@ foreign import ccall safe "c_fsevents.h createWatch" c_createWatch :: Ptr (Ptr C
                                                                    -> Ptr (CInt)
                                                                    -> Ptr (Ptr CWatch)
                                                                    -> IO CInt
+
+-- | The most recently generated event ID, system-wide. Pass this to
+-- 'eventStreamCreateSince' to start a stream without a gap.
+getCurrentEventId :: IO Word64
+getCurrentEventId = c_getCurrentEventId
+
+foreign import ccall safe "c_fsevents.h getCurrentEventId" c_getCurrentEventId :: IO Word64
 
 foreign import ccall safe "c_fsevents.h destroyWatch" c_destroyWatch :: Ptr CWatch
                                                                      -> IO ()
